@@ -155,6 +155,7 @@
 </div>
 
 <div id="typebar">
+  <button id="typeClose" style="width:42px;height:42px;flex-shrink:0;border-radius:50%;border:1px solid var(--line);background:rgba(20,16,36,.85);color:var(--muted);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
   <input id="typeInput" type="text" placeholder="Speak to Maya…" autocomplete="off">
   <button id="typeSend">Send</button>
 </div>
@@ -623,6 +624,11 @@ function sendTyped(){
   ask(txt);
 }
 document.getElementById('typeSend').addEventListener('click', sendTyped);
+document.getElementById('typeClose').addEventListener('click', () => {
+  typebar.classList.remove('open');
+  document.getElementById('controls').style.display = 'flex';
+  typeInput.value = '';
+});
 typeInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
 
 /* settings */
@@ -656,6 +662,28 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   localStorage.setItem('maya-el-voice', S.settings.elVoice);
   sheet.classList.remove('open');
 });
+
+/* ---------------- iOS audio unlock ---------------- */
+// iPhone blocks audio that isn't triggered directly by a tap.
+// We play a silent buffer on first touch to unlock the audio context
+// so ElevenLabs audio plays freely after async calls.
+function unlockAudio(){
+  try{
+    const ac = ensureAC();
+    const buf = ac.createBuffer(1, 1, 22050);
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.connect(ac.destination);
+    src.start(0);
+    // Also unlock HTML5 audio
+    const a = new Audio();
+    a.play().catch(()=>{});
+  }catch(e){}
+  document.removeEventListener('touchstart', unlockAudio);
+  document.removeEventListener('click', unlockAudio);
+}
+document.addEventListener('touchstart', unlockAudio, {once: true});
+document.addEventListener('click', unlockAudio, {once: true});
 
 /* ---------------- boot ---------------- */
 resize();
