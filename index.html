@@ -63,6 +63,12 @@
   #mic.live{box-shadow:0 0 0 3px rgba(212,169,74,.25), 0 0 42px rgba(212,169,74,.45);animation:breathe 1.6s ease-in-out infinite}
   @keyframes breathe{0%,100%{box-shadow:0 0 0 3px rgba(212,169,74,.2),0 0 30px rgba(212,169,74,.35)}50%{box-shadow:0 0 0 7px rgba(212,169,74,.12),0 0 60px rgba(212,169,74,.55)}}
   #mic svg{width:28px;height:28px}
+  #mic.rec{
+    border-color:rgba(224,110,90,.8);color:#E8A08F;
+    box-shadow:0 0 0 4px rgba(224,110,90,.18), 0 0 44px rgba(224,110,90,.4);
+    animation:recPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes recPulse{0%,100%{box-shadow:0 0 0 4px rgba(224,110,90,.15),0 0 34px rgba(224,110,90,.35)}50%{box-shadow:0 0 0 8px rgba(224,110,90,.1),0 0 58px rgba(224,110,90,.5)}}
   .side-btn{
     width:46px;height:46px;border-radius:50%;border:1px solid var(--line);
     background:rgba(20,16,36,.55);display:flex;align-items:center;justify-content:center;
@@ -576,25 +582,128 @@ async function speak(text){
   }catch(e){ setMode('listen'); }
 }
 
-/* ---------------- her ears ---------------- */
+/* ---------------- her ears ----------------
+   Engine 1: Web Speech API (Safari) — instant, free.
+   Engine 2: MediaRecorder + ElevenLabs Scribe (Chrome iOS, everything else).
+   Watchdogs everywhere: the mic can never get stuck. Tap again to finish/cancel.
+*/
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_IOS_ALT_BROWSER = /CriOS|FxiOS|EdgiOS|OPiOS/.test(navigator.userAgent);
 
-function listenOnce(){
-  if (!SR){
-    addLine('assistant', 'Voice input is not supported here — use the keyboard button.');
-    return;
-  }
-  if (S.listening) return;
+let srRef = null, srWatchdog = null;
+const rec = { active:false, mr:null, chunks:[], stream:null, timer:null };
+
+function listenStart(){
+  if (rec.active){ recStop(); return; }          // tap again → finish recording
+  if (S.listening){ srCancel(); return; }        // tap again → cancel
+  if (SR && !IS_IOS_ALT_BROWSER) srStart();
+  else recStart();
+}
+
+/* --- Engine 1: SpeechRecognition --- */
+function srStart(){
+  let got = false;
   const r = new SR();
-  r.lang = 'en-US';
-  r.interimResults = false;
-  r.maxAlternatives = 1;
+  srRef = r;
+  r.lang = 'en-US'; r.interimResults = false; r.maxAlternatives = 1;
   S.listening = true;
   setMode('listen');
-  r.onresult = (e) => ask(e.results[0][0].transcript);
-  r.onerror = () => { S.listening = false; };
-  r.onend = () => { S.listening = false; };
-  try{ r.start(); }catch(e){ S.listening = false; }
+  srWatchdog = setTimeout(() => {                 // silent failure → fall back
+    if (!got){ try{ r.abort(); }catch(e){} S.listening = false; recStart(); }
+  }, 8000);
+  r.onresult = (e) => {
+    got = true; clearTimeout(srWatchdog); S.listening = false;
+    ask(e.results[0][0].transcript);
+  };
+  r.onerror = (e) => {
+    clearTimeout(srWatchdog); S.listening = false;
+    if (!got && ['not-allowed','service-not-allowed','audio-capture','network'].includes(e.error)){
+      recStart();                                 // engine broken here → fall back
+    }
+  };
+  r.onend = () => { clearTimeout(srWatchdog); S.listening = false; };
+  try{ r.start(); }catch(e){ S.listening = false; recStart(); }
+}
+function srCancel(){
+  clearTimeout(srWatchdog);
+  try{ srRef && srRef.abort(); }catch(e){}
+  S.listening = false;
+  setMode('listen');
+}
+
+/* --- Engine 2: MediaRecorder + ElevenLabs Scribe --- */
+async function recStart(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    addLine('assistant', 'This browser cannot record audio — use the keyboard button.');
+    return;
+  }
+  try{
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  }catch(e){
+    addLine('assistant', 'Microphone permission denied. Allow mic access in browser settings, then try again.');
+    return;
+  }
+  const mime = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/mp4')) ? 'audio/mp4'
+             : (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm')) ? 'audio/webm' : '';
+  try{
+    rec.mr = new MediaRecorder(rec.stream, mime ? { mimeType: mime } : undefined);
+  }catch(e){
+    rec.stream.getTracks().forEach(t => t.stop());
+    addLine('assistant', 'Recording is not supported in this browser — use the keyboard button.');
+    return;
+  }
+  rec.chunks = [];
+  rec.active = true;
+  if (S.mode === 'sleep') awaken();
+  setMode('listen');
+  stateLabel.textContent = 'listening — tap to finish';
+  micBtn.classList.add('rec');
+  rec.mr.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  rec.mr.onstop = onRecStop;
+  rec.mr.start();
+  rec.timer = setTimeout(recStop, 30000);         // hard cap: never records forever
+}
+function recStop(){
+  if (!rec.active) return;
+  rec.active = false;
+  clearTimeout(rec.timer);
+  micBtn.classList.remove('rec');
+  try{ rec.mr.stop(); }catch(e){ cleanupStream(); setMode('listen'); }
+}
+function cleanupStream(){
+  if (rec.stream){ rec.stream.getTracks().forEach(t => t.stop()); rec.stream = null; }
+}
+async function onRecStop(){
+  cleanupStream();
+  const type = (rec.mr && rec.mr.mimeType) || 'audio/mp4';
+  const blob = new Blob(rec.chunks, { type });
+  rec.chunks = [];
+  if (blob.size < 2500){ setMode('listen'); return; }   // too short / accidental tap
+  if (!S.settings.elKey){
+    addLine('assistant', 'I recorded you, but transcribing in this browser needs your ElevenLabs key — add it in settings, or use the keyboard.');
+    setMode('listen');
+    return;
+  }
+  setMode('think');
+  stateLabel.textContent = 'hearing you';
+  try{
+    const fd = new FormData();
+    fd.append('file', blob, 'speech.' + (type.includes('mp4') ? 'mp4' : 'webm'));
+    fd.append('model_id', 'scribe_v1');
+    const res = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+      method: 'POST',
+      headers: { 'xi-api-key': S.settings.elKey },
+      body: fd,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error((data.detail && data.detail.message) || ('transcription failed, status ' + res.status));
+    const text = (data.text || '').trim();
+    if (!text){ setMode('listen'); return; }
+    ask(text);
+  }catch(e){
+    addLine('assistant', "I couldn't make that out: " + e.message);
+    setMode('listen');
+  }
 }
 
 /* ---------------- UI wiring ---------------- */
@@ -602,8 +711,9 @@ micBtn.addEventListener('click', () => {
   ensureAC();
   if (currentAudio){ currentAudio.pause(); stopLevel(); }
   speechSynthesis.cancel();
-  if (S.mode === 'sleep') awaken(() => setTimeout(listenOnce, 250));
-  else listenOnce();
+  if (rec.active || S.listening){ listenStart(); return; }   // acts as finish/cancel
+  if (S.mode === 'sleep') awaken(() => setTimeout(listenStart, 250));
+  else listenStart();
 });
 
 const typebar = document.getElementById('typebar');
